@@ -1,0 +1,4 @@
+RPi.GPIO
+rpi-ws281x
+smbus2
+picamera2
