@@ -1,0 +1,1 @@
+"""Rover hardware modules package."""

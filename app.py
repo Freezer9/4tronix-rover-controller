@@ -16,12 +16,24 @@ import socket
 import socketserver
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
+rover = None
+PSControllerService = None
+Picamera2 = None
+MJPEGEncoder = None
+FileOutput = None
+
 try:
-    import roverlib as rover
+    import modules.roverlib as rover
     ROVER_AVAILABLE = True
-except ImportError:
+except Exception as exc:
     ROVER_AVAILABLE = False
-    print("[WARN] roverlib not found — mock mode")
+    print(f"[WARN] roverlib unavailable: {exc}")
+
+try:
+    from pscontroller import PSControllerService
+    CONTROLLER_AVAILABLE = True
+except ImportError:
+    CONTROLLER_AVAILABLE = False
 
 try:
     from picamera2 import Picamera2
@@ -40,9 +52,12 @@ WATCHDOG_S = 2.0
 
 # ── Rover state ───────────────────────────────────────────────────────────────
 state = {"speed": 40, "direction": 1, "drive_type": "Straight",
-         "radius_cm": 200, "status": "STOPPED", "distance": 0.0}
+         "radius_cm": 200, "status": "STOPPED", "distance": 0.0,
+         "source": "web"}
 state_lock = threading.Lock()
 last_cmd_ts = time.time()
+controller_service = None
+_drive_api_warned = False
 
 
 def watchdog():
@@ -65,12 +80,81 @@ def init_rover():
 
 
 def send_drive():
+    global _drive_api_warned
     if not ROVER_AVAILABLE:
         return
+
+    powerpct = state["direction"] * state["speed"]
+    drive_type = state["drive_type"]
+    radius_cm = state["radius_cm"]
+
     rover.obstacleDetected = False
-    rover.changeDrive(state["drive_type"],
-                      state["direction"] * state["speed"],
-                      state["radius_cm"])
+    try:
+        rover.changeDrive(drive_type, powerpct, radius_cm)
+        return
+    except TypeError:
+        # Backward compatibility: older roverlib exposes changeDrive(driveType, powerpct)
+        # while Ackermandrive still supports radius for Arc/Spin.
+        if not _drive_api_warned:
+            print(
+                "[WARN] roverlib.changeDrive uses legacy signature; using compatibility mode")
+            _drive_api_warned = True
+
+        if drive_type in ("Arc", "Spin") and hasattr(rover, "Ackermandrive"):
+            rover.Ackermandrive(drive_type, powerpct, radius_cm)
+        else:
+            rover.changeDrive(drive_type, powerpct)
+
+
+def handle_control_command(cmd, value=None, source="web"):
+    global last_cmd_ts
+
+    with state_lock:
+        last_cmd_ts = time.time()
+        state["source"] = source
+
+        if cmd == "forward":
+            state.update(direction=1, drive_type="Straight",
+                         radius_cm=200, status="FORWARD")
+            send_drive()
+        elif cmd == "backward":
+            state.update(direction=-1, drive_type="Straight",
+                         radius_cm=200, status="BACKWARD")
+            send_drive()
+        elif cmd == "arc_left":
+            state.update(direction=1, drive_type="Arc",
+                         radius_cm=-40, status="ARC LEFT")
+            send_drive()
+        elif cmd == "arc_right":
+            state.update(direction=1, drive_type="Arc",
+                         radius_cm=40, status="ARC RIGHT")
+            send_drive()
+        elif cmd == "spin_left":
+            state.update(direction=-1, drive_type="Spin",
+                         radius_cm=0, status="SPIN LEFT")
+            send_drive()
+        elif cmd == "spin_right":
+            state.update(direction=1, drive_type="Spin",
+                         radius_cm=0, status="SPIN RIGHT")
+            send_drive()
+        elif cmd == "stop":
+            state["status"] = "STOPPED"
+            if ROVER_AVAILABLE:
+                rover.stopMotors()
+        elif cmd == "speed":
+            if value is None:
+                value = 40
+            if source == "controller" and isinstance(value, int) and abs(value) <= 20:
+                new_speed = state["speed"] + value
+            else:
+                new_speed = int(value)
+            state["speed"] = max(10, min(100, new_speed))
+            if state["status"] != "STOPPED":
+                send_drive()
+        elif cmd == "ping":
+            pass
+
+        return {"status": state["status"], "speed": state["speed"]}
 
 # ── Camera streaming ──────────────────────────────────────────────────────────
 
@@ -150,7 +234,30 @@ class RoverHandler(BaseHTTPRequestHandler):
                 except Exception:
                     pass
             state["distance"] = dist
-            self._json(state)
+            payload = dict(state)
+            payload["controller"] = controller_service.snapshot() if controller_service else {
+                "available": False,
+                "enabled": False,
+                "connected": False,
+                "discovered": False,
+                "paired": False,
+                "name": "",
+                "address": "",
+                "device_path": "",
+                "source": "none",
+                "last_command": "",
+                "last_event": "",
+                "message": "Controller support unavailable",
+                "last_seen": 0.0,
+            }
+            self._json(payload)
+
+        elif self.path == "/controller":
+            if controller_service:
+                self._json(controller_service.snapshot())
+            else:
+                self.send_response(404)
+                self.end_headers()
 
         else:
             self.send_response(404)
@@ -158,51 +265,35 @@ class RoverHandler(BaseHTTPRequestHandler):
 
     # ── POST ──────────────────────────────────────────────────────────────────
     def do_POST(self):
-        global last_cmd_ts
-        if self.path != "/control":
+        if self.path not in ("/control", "/controller"):
             self.send_response(404)
             self.end_headers()
             return
 
         length = int(self.headers.get("Content-Length", 0))
-        data = json.loads(self.rfile.read(length))
+        data = json.loads(self.rfile.read(length) or b"{}")
+
+        if self.path == "/controller":
+            if not controller_service:
+                self.send_response(404)
+                self.end_headers()
+                return
+
+            action = data.get("action", "rescan")
+            address = data.get("address", "")
+            if action == "pair" and address:
+                ok = controller_service.pair_device(address)
+                self._json(
+                    {"ok": ok, "controller": controller_service.snapshot()})
+            else:
+                controller_service.refresh_devices()
+                self._json(
+                    {"ok": True, "controller": controller_service.snapshot()})
+            return
+
         cmd = data.get("cmd", "")
-
-        with state_lock:
-            last_cmd_ts = time.time()
-            if cmd == "forward":
-                state.update(direction=1,  drive_type="Straight",
-                             radius_cm=200, status="FORWARD")
-                send_drive()
-            elif cmd == "backward":
-                state.update(direction=-1, drive_type="Straight",
-                             radius_cm=200, status="BACKWARD")
-                send_drive()
-            elif cmd == "arc_left":
-                state.update(drive_type="Arc",
-                             radius_cm=-40, status="ARC LEFT")
-                send_drive()
-            elif cmd == "arc_right":
-                state.update(drive_type="Arc",
-                             radius_cm=40,  status="ARC RIGHT")
-                send_drive()
-            elif cmd == "spin_left":
-                state.update(direction=-1, drive_type="Spin",
-                             radius_cm=0,   status="SPIN LEFT")
-                send_drive()
-            elif cmd == "spin_right":
-                state.update(direction=1,  drive_type="Spin",
-                             radius_cm=0,   status="SPIN RIGHT")
-                send_drive()
-            elif cmd == "stop":
-                state["status"] = "STOPPED"
-                if ROVER_AVAILABLE:
-                    rover.stopMotors()
-            elif cmd == "speed":
-                state["speed"] = max(10, min(100, int(data.get("value", 40))))
-            # "ping" just resets watchdog — no action needed
-
-        self._json({"status": state["status"], "speed": state["speed"]})
+        result = handle_control_command(cmd, data.get("value"), "web")
+        self._json(result)
 
     def _json(self, obj):
         body = json.dumps(obj).encode()
@@ -283,6 +374,7 @@ header{display:flex;align-items:center;justify-content:space-between;padding:var
 .tbtn{width:36px;height:36px;border-radius:var(--r-md);display:grid;place-items:center;color:var(--muted)}
 .tbtn:hover{background:var(--sur3);color:var(--text)}
 main{display:grid;grid-template-columns:1fr 310px;gap:var(--s6);padding:var(--s6);max-width:1200px;margin-inline:auto;width:100%;align-items:start}
+.left-stack{display:flex;flex-direction:column;gap:var(--s4)}
 .cam-panel{background:var(--sur);border:1px solid var(--bdr);border-radius:var(--r-xl);overflow:hidden;box-shadow:var(--shd)}
 .panel-hdr{display:flex;align-items:center;justify-content:space-between;padding:var(--s3) var(--s5);border-bottom:1px solid var(--bdr)}
 .panel-title{font-size:var(--text-xs);font-weight:600;text-transform:uppercase;letter-spacing:.08em;color:var(--muted)}
@@ -319,6 +411,9 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:18px;heigh
 .spd-bump{flex:1;padding:var(--s2) 0;border-radius:var(--r-md);background:var(--sur2);border:1px solid var(--bdr);font-family:var(--mono);font-size:var(--text-sm);font-weight:600;color:var(--muted)}
 .spd-bump:hover{background:var(--sur3);color:var(--text)}
 .spd-bump:active{background:var(--pri);color:#fff;transform:scale(.96)}
+.sel-row{display:flex;gap:var(--s2);align-items:center}
+select.bt-select{flex:1;min-width:0;padding:var(--s2) var(--s3);border-radius:var(--r-md);border:1px solid var(--bdr);background:var(--sur2);color:var(--text);font:inherit}
+.bt-note{margin-top:var(--s3);font-size:var(--text-xs);color:var(--muted);font-family:var(--mono)}
 .tgrid{display:grid;grid-template-columns:1fr 1fr;gap:var(--s3)}
 .ti{background:var(--sur2);border-radius:var(--r-lg);padding:var(--s3) var(--s4)}
 .ti-lbl{font-size:var(--text-xs);color:var(--muted);margin-bottom:var(--s1)}
@@ -354,6 +449,7 @@ footer{padding:var(--s3) var(--s6);border-top:1px solid var(--bdr);font-size:var
 </header>
 
 <main>
+  <div class="left-stack">
   <div class="cam-panel">
     <div class="panel-hdr">
       <span class="panel-title">Live — IMX500 AI Camera</span>
@@ -372,6 +468,22 @@ footer{padding:var(--s3) var(--s6);border-top:1px solid var(--bdr);font-size:var
       <img src="/stream.mjpg" alt="Live rover camera" id="cam"
            onerror="this.style.display='none';document.getElementById('nocam').style.display='block'">
       <div class="no-cam" id="nocam" style="display:none">Camera unavailable</div>
+    </div>
+  </div>
+
+    <div class="card">
+      <div class="card-lbl">Bluetooth Controller</div>
+      <div class="sel-row">
+        <select id="bt-device" class="bt-select" aria-label="Detected Bluetooth devices">
+          <option value="">Scan for devices</option>
+        </select>
+        <button class="spd-bump" id="bt-refresh" aria-label="Refresh device list">Scan</button>
+      </div>
+      <div class="sel-row" style="margin-top:var(--s3)">
+        <button class="spd-bump" id="bt-pair" aria-label="Pair selected device">Pair Selected</button>
+      </div>
+      <div class="bt-note" id="bt-note">No Bluetooth device selected</div>
+      <div class="bt-note" id="bt-status">Waiting for scan</div>
     </div>
   </div>
 
@@ -462,6 +574,30 @@ function setStatus(s, ping) {
   if (ping != null) document.getElementById('t-ping').textContent = ping + ' ms';
 }
 
+function setController(c) {
+  const select = document.getElementById('bt-device');
+  const devices = Array.isArray(c && c.devices) ? c.devices : [];
+  const currentValue = select.value;
+  if (devices.length === 0) {
+    select.innerHTML = '<option value="">No Bluetooth devices detected</option>';
+    select.value = '';
+  } else {
+    select.innerHTML = devices.map(d => {
+      const parts = [];
+      if (d.name) parts.push(d.name);
+      parts.push(d.address);
+      const label = parts.join(' - ');
+      const selected = d.address === currentValue || d.connected;
+      return `<option value="${d.address}"${selected ? ' selected' : ''}>${label}</option>`;
+    }).join('');
+    if (!select.value) {
+      select.value = devices[0].address;
+    }
+  }
+  document.getElementById('bt-note').textContent = c && c.name ? `${c.name} ${c.connected ? 'connected' : 'detected'}` : 'No Bluetooth device selected';
+  document.getElementById('bt-status').textContent = c && c.message ? c.message : 'Waiting for scan';
+}
+
 // ── Command — fire-and-forget, reuse connection ───────────────────────────────
 function send(cmd, extra={}) {
   const t0 = performance.now();
@@ -494,13 +630,33 @@ function applySpeed(v) {
   spd = Math.max(10, Math.min(100, v));
   slider.value = spd;
   slider.style.setProperty('--p', ((spd-10)/90*100).toFixed(1)+'%');
-  document.getElementById('spd-disp').innerHTML = spd+'<span class="spd-unit">%</span>';
+  document.getElementById('spd-disp').innerHTML = spd + '<span class="spd-unit">%</span>';
   document.getElementById('t-speed').textContent = spd+'%';
   send('speed',{value:spd});
 }
 slider.addEventListener('input', ()=>applySpeed(+slider.value));
 document.getElementById('spd-up').addEventListener('click', ()=>applySpeed(spd+10));
 document.getElementById('spd-dn').addEventListener('click', ()=>applySpeed(spd-10));
+
+function controllerAction(action, address='') {
+  return fetch('/controller', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({action, address})
+  }).then(r => r.json()).then(d => {
+    if (d && d.controller) setController(d.controller);
+  }).catch(()=>{});
+}
+
+document.getElementById('bt-refresh').addEventListener('click', () => controllerAction('rescan'));
+document.getElementById('bt-pair').addEventListener('click', () => {
+  const address = document.getElementById('bt-device').value;
+  if (address) {
+    controllerAction('pair', address);
+  }
+});
+
+controllerAction('rescan');
 
 // ── Keyboard ──────────────────────────────────────────────────────────────────
 const driveKeys = {w:'forward',s:'backward',a:'spin_left',d:'spin_right'};
@@ -536,6 +692,7 @@ setInterval(async()=>{
   try{
     const d = await(await fetch('/state')).json();
     setStatus(d.status);
+    setController(d.controller);
     document.getElementById('t-dist').textContent =
       d.distance>0 ? d.distance.toFixed(1)+' cm' : '— cm';
   }catch(e){}
@@ -548,8 +705,16 @@ setInterval(async()=>{
 if __name__ == "__main__":
     if ROVER_AVAILABLE:
         init_rover()
+    if CONTROLLER_AVAILABLE and PSControllerService is not None:
+        controller_service = PSControllerService(handle_control_command)
     start_camera()
     threading.Thread(target=watchdog, daemon=True).start()
     server = RoverServer(("", PORT), RoverHandler)
     print(f"Rover Web Controller → http://0.0.0.0:{PORT}")
-    server.serve_forever()
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if controller_service:
+            controller_service.stop()

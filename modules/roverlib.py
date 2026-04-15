@@ -18,12 +18,16 @@
 import RPi.GPIO as GPIO
 import sys
 import time
-import smbus
 import tty
 import termios
 import math
 import threading
 from rpi_ws281x import *
+
+try:
+    import smbus2 as smbus
+except ImportError:
+    import smbus
 
 # Global variables and configuration data
 debugFlag = False      # used to print debug info to screen
@@ -169,13 +173,22 @@ def initMotors():
 #         elif (driveType == 'Spin'):
 #             Ackermandrive(driveType, powerpct, radiusCm)
 
-def changeDrive(driveType, powerpct):
-    if not obstacleDetected and powerpct != 0:
-        if driveType == "Straight":
-            if (currentFLdegrees != 0 or currentFRdegrees != 0 or
-                    currentRLdegrees != 0 or currentRRdegrees != 0):
-                setWheelServosSmooth(0, 0, 0, 0)   # only if coming from a turn
-            setMotors(powerpct)
+def changeDrive(driveType, powerpct, radiusCm=200):
+    # Implements requested mode except when obstacle detection blocks forward motion.
+    if obstacleDetected and powerpct > 0:
+        return
+
+    if powerpct == 0:
+        stopMotors()
+        return
+
+    if driveType == "Straight":
+        if (currentFLdegrees != 0 or currentFRdegrees != 0 or
+                currentRLdegrees != 0 or currentRRdegrees != 0):
+            setWheelServosSmooth(0, 0, 0, 0)   # only if coming from a turn
+        setMotors(powerpct)
+    elif driveType in ("Arc", "Spin"):
+        Ackermandrive(driveType, powerpct, radiusCm)
 
 
 def setMotors(powerpct):

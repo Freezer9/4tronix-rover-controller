@@ -1,38 +1,96 @@
-# 4tronix M.A.R.S. Rover installation
+# 4tronix M.A.R.S. Rover
 
-This installation guide explains how to install the basic software for your 4tronix M.A.R.S. Rover on a Raspberry Pi Zero so you can then manually control it from a PC/laptop. Future additions are described at the end.
-
-The ultimate aim is to develop an autonomous (i.e. without human interference) search and rescue robot using the 4tronix M.A.R.S. Rover platform.
-
-The base software is based on the test software provided by 4tronix but then integrated into one total library, called from one separate control program. One of the main additions is the Ackermann steering geometry so that the wheels turn to the correct position to ensure minimum slippage (Wikipedia for more info). Also the mast position and LED color and behaviour is linked to the driving behaviour.
-
-This guide assumes basic knowledge about installing and configuring a Raspberry Pi. For more info visit raspberrypi.com and go to the documentation section.
-
-# Installation steps:
+## Hardware Setup
 
 1. Assemble the 4tronix M.A.R.S Rover as per the instructions on the 4tronix website.
 2. Install the Raspberry Pi operating system for the P Zero W with the Raspberry Pi Imager (Legacy Edition), with SSH enabled, with your WIFI network configured, with your own choice of hostname, user and password.
-3. Once the image installation is complete, insert the SD card in your Raspberry Pi and start it up. Find the IP address, start PuTTY, open the IP address and login into the system en then run “sudo apt update” and “sudo apt upgrade”.
-4. Run “sudo raspi-config” and enable SPI and I2C in the interface options, followed by a reboot.
-5. Copy the following files from github and then, use "scp" to copy them to your Raspberry Pi:
 
--     roverlib.py
--     app.py
--     fullServoCalibrate.py
--     requirements.txt
+## Software Overview
 
-6. Switch to root and create/activate a virtual environment:
+This repository contains the control software for a 4tronix M.A.R.S. Rover on Raspberry Pi.
+It provides:
 
--     "sudo su"
--     "python -m venv env"
--     "source env/bin/activate"
+- a rover hardware library for GPIO, servos, motors, LEDs, sonar, and EEPROM calibration data
+- an interactive servo calibration tool
+- a web-based rover controller in `app.py`
+- PlayStation controller support over Bluetooth that auto-pairs when the controller is seen on the Pi
 
-7. Install project dependencies listed in requirements.txt:
+The current goal is manual rover control first, with a clean base for later autonomy work.
 
--     "pip install -r requirements.txt"
+## Repository layout
 
-8. Run "python3 fullServoCalibrate.py" to perform the calibration of the four corner servos. Follow the on-screen instructions to select each servo in turn and move each one into the 3 positions (right 90 degrees,middle,left 90 degrees). Use the arrow keys to make the positions as accurate as possible and press s when ready.
-9. After the calibration you can attach the wheels to the motors.
-10. Run "python3 app.py" to start the rover control web app.
+```text
+app.py                 Web UI and HTTP API for rover control
+modules/roverlib.py    Hardware pin mapping and low-level rover control
+modules/servo_calibrate.py
+					   Interactive servo calibration utility
+pscontroller/          Bluetooth PlayStation controller support
+requirements.txt       Python dependencies
+```
 
-# Have fun !!!
+See [modules/README.md](modules/README.md) for module details and [pscontroller/README.md](pscontroller/README.md) for the controller folder.
+
+Service and manual Bluetooth pairing guide: [RUN_AS_SERVICE.md](RUN_AS_SERVICE.md)
+
+## What each part does
+
+`app.py` starts the rover control server and serves the browser UI.
+
+`modules/roverlib.py` contains the Rover hardware setup and helper functions:
+
+- motor pin configuration
+- wheel servo control
+- mast servo control
+- LED control
+- sonar support
+- EEPROM-backed servo offsets
+
+`modules/servo_calibrate.py` is the calibration utility. It lets you tune each servo midpoint and both end stops, then saves the offsets back to EEPROM.
+
+`pscontroller/` contains the Bluetooth PlayStation controller integration. It scans for a known controller, pairs and trusts it through `bluetoothctl`, then reads Linux input events through `evdev`.
+
+## Installation
+
+1. Assemble the rover following the 4tronix build guide.
+2. Install Raspberry Pi OS on the Pi Zero W or compatible Pi.
+3. Enable SSH, Wi-Fi, and your preferred hostname, user, and password during imaging.
+4. Boot the Pi, update packages, and enable SPI and I2C in `raspi-config`.
+5. Copy this repository to the Pi.
+6. Create and activate a virtual environment.
+7. Install dependencies from `requirements.txt`.
+
+Example commands:
+
+```bash
+python -m venv env
+source env/bin/activate
+pip install -r requirements.txt
+```
+
+## First run
+
+1. Calibrate servos before attaching wheels.
+2. Run the calibration tool:
+
+```bash
+python3 modules/servo_calibrate.py
+```
+
+3. Follow the prompts to select each servo and tune midpoint, right, and left positions.
+4. Save the calibration data when finished.
+5. Attach the wheels after calibration.
+6. Start the rover web app:
+
+```bash
+python3 app.py
+```
+
+## Notes
+
+- `app.py` can run in mock mode if rover hardware is not present.
+- Camera support is optional and depends on `picamera2`.
+- Bluetooth controller support is handled by the `pscontroller/` package and can run in web mode or controller-only mode.
+
+## Future work
+
+- Autonomous drive logic
